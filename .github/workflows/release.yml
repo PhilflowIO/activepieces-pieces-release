@@ -1,0 +1,420 @@
+name: Release
+
+# Publishes one of our Activepieces pieces to public npm as
+# @philflow/piece-<slug>. Pushing a tag `piece-<slug>@<version>` on a commit of
+# main starts it; nothing else does.
+#
+# The code comes from the fork PhilflowIO/activepieces, at the commit pinned in
+# pieces/<slug>.json on the tagged commit. Actions stay disabled on the fork for
+# good: it carries upstream's workflows, and a sync push would run any new one
+# before it could be disabled. This repository holds nothing but this release,
+# so it is the one that builds and publishes, and the one npm's trusted
+# publisher and provenance name. The pin is reviewed like any other change, so
+# what is published is decided by a commit here, not by whatever the fork's
+# branch points at when a tag is pushed.
+#
+# Authentication is npm trusted publishing (GitHub OIDC): the publish job runs
+# in the `npm-publish` environment, which the trusted publisher on npmjs.com is
+# bound to and which only `piece-*@*` tags may deploy to, with a required
+# reviewer (set in the repository settings, not here: a check in this file can
+# be removed by whoever pushes a tag with an edited copy of it). There is no npm
+# token in the repository secrets.
+#
+# Order: build (install, build, test, bundle, pack) -> verify (install the
+# tarball into an empty project against public npm and load the piece) ->
+# publish. Building a piece runs third-party code (bun install, the bundler), so
+# it cannot be packed before anything is installed, as dav-mcp's release is;
+# what the later jobs guarantee is that npm receives exactly the file that
+# installed and loaded, checked by sha256 and sha512 at every hand-over.
+#
+# Re-running: use "Re-run failed jobs"; that keeps the tarball the build job
+# packed. A version already on npm is never replaced: same bytes -> the publish
+# step does nothing, different bytes -> it fails.
+#
+# Actions are pinned to commit SHAs (the pins of dav-mcp's release.yml): a tag
+# can be moved, and the publish job holds a token that can publish.
+on:
+  push:
+    tags:
+      - 'piece-*@*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORK: PhilflowIO/activepieces
+
+jobs:
+  build:
+    name: Build, test and pack
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.tag.outputs.slug }}
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      fork_commit: ${{ steps.pin.outputs.fork_commit }}
+      name: ${{ steps.manifest.outputs.name }}
+      asset: ${{ steps.pack.outputs.asset }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+      integrity: ${{ steps.pack.outputs.integrity }}
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # full history, for the ancestry check below
+
+      # Tag format piece-<slug>@<version>; only plain semver, since npm would
+      # drop +build metadata and publish a shorter, different version.
+      - name: Read slug and version from the tag
+        id: tag
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^piece-([a-z0-9]+(-[a-z0-9]+)*)@([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "❌ ERROR: tag $GITHUB_REF_NAME is not piece-<slug>@<semver>"
+            exit 1
+          fi
+          SLUG="${BASH_REMATCH[1]}"
+          VERSION="${BASH_REMATCH[3]}"
+          case "$VERSION" in *-*) PRERELEASE=true ;; *) PRERELEASE=false ;; esac
+          {
+            echo "slug=$SLUG"
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ $SLUG@$VERSION (prerelease: $PRERELEASE)"
+
+      - name: Check the tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "❌ ERROR: $GITHUB_REF_NAME ($GITHUB_SHA) is not on main"
+            exit 1
+          fi
+          echo "✅ $GITHUB_SHA is on main"
+
+      # The pin names the fork commit to build, and repeats the version, so a
+      # tag cannot publish a version the pin was not written for.
+      - name: Read the fork pin
+        id: pin
+        env:
+          SLUG: ${{ steps.tag.outputs.slug }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          PIN="pieces/$SLUG.json"
+          [ -f "$PIN" ] || { echo "❌ ERROR: no pin $PIN on $GITHUB_REF_NAME"; exit 1; }
+          COMMIT=$(jq -er '.fork_commit' "$PIN")
+          PINNED=$(jq -er '.version' "$PIN")
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "❌ ERROR: $PIN fork_commit is not a full SHA"; exit 1; }
+          [ "$PINNED" = "$VERSION" ] || { echo "❌ ERROR: $PIN pins version $PINNED, the tag asks for $VERSION"; exit 1; }
+          echo "fork_commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "✅ $FORK@$COMMIT"
+
+      - name: Checkout the fork at the pinned commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.FORK }}
+          ref: ${{ steps.pin.outputs.fork_commit }}
+          persist-credentials: false
+          fetch-depth: 0
+          path: fork
+
+      # Only code that went through review into raven may be published, and
+      # only a piece raven carries on top of upstream: an upstream piece is
+      # upstream's to publish.
+      - name: Check the pin is on raven and the piece is ours
+        working-directory: fork
+        env:
+          SLUG: ${{ steps.tag.outputs.slug }}
+          COMMIT: ${{ steps.pin.outputs.fork_commit }}
+        run: |
+          DIR="packages/pieces/community/$SLUG"
+          git fetch --quiet origin raven main
+          if ! git merge-base --is-ancestor "$COMMIT" origin/raven; then
+            echo "❌ ERROR: $COMMIT is not on the fork's raven branch"
+            exit 1
+          fi
+          [ -f "$DIR/package.json" ] || { echo "❌ ERROR: no piece at $DIR in $COMMIT"; exit 1; }
+          if git cat-file -e "origin/main:$DIR/package.json" 2>/dev/null; then
+            echo "❌ ERROR: $DIR exists on the fork's main, so it is an upstream piece"
+            exit 1
+          fi
+          echo "✅ $COMMIT is on raven and $DIR is ours"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      # npm pinned as in the publish job. Bun at the version upstream pins in
+      # packageManager, from npm without its install script, which only links
+      # the platform binary.
+      - name: Use npm 12.2.0 and upstream's bun
+        run: |
+          BUN_VERSION=$(node -p "require('./fork/package.json').packageManager.split('@')[1]")
+          npm install --global --ignore-scripts --no-audit --no-fund npm@12.2.0
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/bin"
+          npm install --prefix "$RUNNER_TEMP/tools" --ignore-scripts --no-audit --no-fund "bun@$BUN_VERSION"
+          ln -sf "$RUNNER_TEMP/tools/node_modules/@oven/bun-linux-x64/bin/bun" "$RUNNER_TEMP/bin/bun"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          [ "$("$RUNNER_TEMP/bin/bun" --version)" = "$BUN_VERSION" ] || { echo "❌ ERROR: expected bun $BUN_VERSION"; exit 1; }
+          echo "npm $(npm --version), bun $BUN_VERSION"
+
+      # No dependency cache, as in every release workflow of ours.
+      - name: Install dependencies
+        working-directory: fork
+        run: bun install --frozen-lockfile
+        env:
+          REDISMS_DISABLE_POSTINSTALL: '1'
+
+      - name: Build the piece
+        working-directory: fork
+        env:
+          SLUG: ${{ steps.tag.outputs.slug }}
+        run: npx turbo run build "--filter=@activepieces/piece-$SLUG" --force
+
+      - name: Run the piece's tests
+        working-directory: fork/packages/pieces/community/${{ steps.tag.outputs.slug }}
+        run: npx vitest run
+
+      # Upstream's own step: bundles the piece and strips the @activepieces/*
+      # dependencies it inlined (packages/cli/src/lib/utils/prepare-piece-utils.ts).
+      - name: Bundle with upstream's tooling
+        working-directory: fork
+        env:
+          CHANGED_PIECES: packages/pieces/community/${{ steps.tag.outputs.slug }}
+        run: npx ts-node -r tsconfig-paths/register -P packages/server/engine/tsconfig.lib.json tools/scripts/pieces/prepare-pieces-for-publish.ts
+
+      - name: Rename to our scope and check the manifest
+        id: manifest
+        env:
+          SLUG: ${{ steps.tag.outputs.slug }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          COMMIT: ${{ steps.pin.outputs.fork_commit }}
+        run: |
+          OUT=$(node scripts/prepare-piece-release.mjs "fork/packages/pieces/community/$SLUG" "$VERSION" "$COMMIT" "$GITHUB_REPOSITORY")
+          echo "$OUT"
+          echo "name=$(echo "$OUT" | jq -r .name)" >> "$GITHUB_OUTPUT"
+          cat "fork/packages/pieces/community/$SLUG/dist/package.json"
+
+      # Packed from dist/ only: the fork's .npmrc (which names an NPM_TOKEN) is
+      # not in that directory.
+      - name: Pack
+        id: pack
+        env:
+          SLUG: ${{ steps.tag.outputs.slug }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          (cd "fork/packages/pieces/community/$SLUG/dist" && npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release" --json > "$RUNNER_TEMP/pack.json")
+          ASSET=$(jq -r 'to_entries[0].value.filename' "$RUNNER_TEMP/pack.json")
+          tar -tzf "$RUNNER_TEMP/release/$ASSET"
+          for f in package/package.json package/src/index.js package/LICENSE; do
+            tar -tzf "$RUNNER_TEMP/release/$ASSET" | grep -qx "$f" || { echo "❌ ERROR: $f missing from $ASSET"; exit 1; }
+          done
+          SHA256=$(sha256sum "$RUNNER_TEMP/release/$ASSET" | cut -d' ' -f1)
+          INTEGRITY="sha512-$(openssl dgst -sha512 -binary "$RUNNER_TEMP/release/$ASSET" | base64 -w0)"
+          {
+            echo "asset=$ASSET"
+            echo "sha256=$SHA256"
+            echo "integrity=$INTEGRITY"
+          } >> "$GITHUB_OUTPUT"
+          echo "📦 $ASSET sha256 $SHA256 integrity $INTEGRITY"
+          {
+            echo "### Packed $ASSET"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| integrity (for Raven's piece lock) | \`$INTEGRITY\` |"
+            echo "| sha256 | \`$SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand the tarball to the next jobs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Installs the file users will install into an empty project, resolved
+  # against public npm only, and loads the piece from it. A failure here
+  # publishes nothing.
+  verify:
+    name: Install and load packed tarball
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # Only the check script, from the tagged commit.
+      - name: Checkout the check script
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+          path: src
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      # npm 12 refuses git and remote-tarball dependencies by default; a piece
+      # that needs either would fail for its users.
+      - name: Use npm 12.2.0
+        run: npm install --global --ignore-scripts --no-audit --no-fund npm@12.2.0
+
+      - name: Fetch the tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+          path: release
+
+      - name: Install the tarball and load the piece
+        env:
+          ASSET: ${{ needs.build.outputs.asset }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+          NAME: ${{ needs.build.outputs.name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          COMMIT: ${{ needs.build.outputs.fork_commit }}
+          npm_config_allow_git: none
+          npm_config_allow_remote: none
+        run: |
+          echo "$SHA256  release/$ASSET" | sha256sum --check
+          mkdir consumer && cd consumer
+          echo '{ "name": "consumer", "version": "0.0.0", "private": true }' > package.json
+          npm install --no-audit --no-fund --registry=https://registry.npmjs.org "../release/$ASSET"
+          node ../src/scripts/verify-installed-piece.cjs "$NAME" "$VERSION" "$COMMIT"
+
+  # The only job that can publish to npm. It runs no code from either
+  # repository and installs no dependencies: it sends the verified file.
+  publish-npm:
+    name: Publish to npm
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write # OIDC token for npm trusted publishing and provenance
+
+    env:
+      ASSET: ${{ needs.build.outputs.asset }}
+      SHA256: ${{ needs.build.outputs.sha256 }}
+      INTEGRITY: ${{ needs.build.outputs.integrity }}
+      NAME: ${{ needs.build.outputs.name }}
+      VERSION: ${{ needs.build.outputs.version }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+      COMMIT: ${{ needs.build.outputs.fork_commit }}
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm >= 11.5.1; pinned because this npm runs
+      # with the OIDC token.
+      - name: Use npm 12.2.0
+        run: npm install --global --ignore-scripts --no-audit --no-fund npm@12.2.0
+
+      - name: Fetch the tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+          path: release
+
+      - name: Check the tarball is the one that was verified
+        run: |
+          npm --version
+          echo "$SHA256  release/$ASSET" | sha256sum --check
+          LOCAL="sha512-$(openssl dgst -sha512 -binary "release/$ASSET" | base64 -w0)"
+          [ "$LOCAL" = "$INTEGRITY" ] || { echo "❌ ERROR: integrity $LOCAL, build job packed $INTEGRITY"; exit 1; }
+
+      # Same idempotence as dav-mcp: the registry is asked anonymously and past
+      # its CDN cache; same bytes -> nothing to do, different bytes -> fail.
+      - name: Publish with provenance
+        env:
+          npm_config_allow_git: none
+          npm_config_allow_remote: none
+        run: |
+          URL="https://registry.npmjs.org/$NAME/$VERSION"
+          STATUS=$(curl --silent --show-error --header 'Cache-Control: no-cache' \
+            --output "$RUNNER_TEMP/existing.json" --write-out '%{http_code}' "$URL?nocache=$(date +%s%N)")
+          case "$STATUS" in
+            404)
+              echo "ℹ️  $NAME@$VERSION is not on npm yet"
+              ;;
+            200)
+              PUBLISHED=$(jq -r '.dist.integrity' "$RUNNER_TEMP/existing.json")
+              if [ "$PUBLISHED" = "$INTEGRITY" ]; then
+                echo "✅ $NAME@$VERSION is already published with these bytes"
+                exit 0
+              fi
+              echo "❌ ERROR: $NAME@$VERSION is already published with different content"
+              echo "   published: $PUBLISHED"
+              echo "   this run:  $INTEGRITY"
+              exit 1
+              ;;
+            *)
+              echo "❌ ERROR: registry answered $STATUS for $URL"
+              exit 1
+              ;;
+          esac
+          # A bare "release/<file>.tgz" is GitHub shorthand to npm; the spec is
+          # a ./ path and npm's own parser has to read it as a file.
+          SPEC="./release/$ASSET"
+          TYPE=$(node -e 'console.log(require(process.argv[1])(process.argv[2]).type)' \
+            "$(npm root --global)/npm/node_modules/npm-package-arg" "$SPEC")
+          if [ "$TYPE" != file ]; then
+            echo "❌ ERROR: npm reads $SPEC as a $TYPE spec, expected file"
+            exit 1
+          fi
+          DIST_TAG=latest
+          if [ "$PRERELEASE" = true ]; then DIST_TAG=next; fi
+          npm publish "$SPEC" --provenance --access public --ignore-scripts --tag "$DIST_TAG"
+
+      # The registry's CDN can serve a stale answer for minutes after a publish.
+      - name: Check the registry serves the verified tarball
+        run: |
+          URL="https://registry.npmjs.org/$NAME/$VERSION"
+          WAITED=0
+          DELAY=5
+          while :; do
+            PUBLISHED=$(curl --silent --fail --header 'Cache-Control: no-cache' "$URL?nocache=$(date +%s%N)" \
+              | jq -r '.dist.integrity // empty' || true)
+            if [ "$PUBLISHED" = "$INTEGRITY" ]; then
+              echo "✅ registry serves $NAME@$VERSION after ${WAITED}s"
+              {
+                echo "### $NAME@$VERSION is on npm"
+                echo ""
+                echo "| | |"
+                echo "|---|---|"
+                echo "| integrity (for Raven's piece lock) | \`$INTEGRITY\` |"
+                echo "| sha256 | \`$SHA256\` |"
+                echo "| fork commit | \`$FORK@$COMMIT\` |"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            case "$PUBLISHED" in
+              sha512-*)
+                echo "❌ ERROR: registry serves different bytes for $NAME@$VERSION"
+                echo "   served:   $PUBLISHED"
+                echo "   verified: $INTEGRITY"
+                exit 1
+                ;;
+            esac
+            if [ "$WAITED" -ge 600 ]; then
+              echo "❌ ERROR: registry did not serve $NAME@$VERSION within ${WAITED}s"
+              exit 1
+            fi
+            echo "ℹ️  not served yet after ${WAITED}s, next check in ${DELAY}s"
+            sleep "$DELAY"
+            WAITED=$((WAITED + DELAY))
+            DELAY=$((DELAY * 2))
+            if [ "$DELAY" -gt 60 ]; then DELAY=60; fi
+          done
