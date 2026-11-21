@@ -16,11 +16,18 @@
 //
 // Usage: prepare-piece-release.mjs <piece dir> <version> <fork commit> <release repo, owner/name>
 // Prints one JSON line: {"name","version","slug","dist","sourceCommit"}.
+//
+// The defaults are the public release (GitHub, @philflow). An internal build
+// for a staging test before anything is public (Philflow/flow.raven#10021)
+// sets PIECE_SCOPE=@philflow-internal, GIT_HOST=https://forgejo.philflow.me
+// and FORK=Philflow/activepieces, so the manifest names where that build
+// really comes from: the private Forgejo mirrors of the fork and of this repo.
 import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 
-const FORK = 'PhilflowIO/activepieces'
-const SCOPE = '@philflow'
+const FORK = process.env.FORK || 'PhilflowIO/activepieces'
+const SCOPE = process.env.PIECE_SCOPE || '@philflow'
+const GIT_HOST = process.env.GIT_HOST || 'https://github.com'
 
 function fail(message) {
   console.error(`ERROR: ${message}`)
@@ -33,6 +40,9 @@ if (!pieceDirArg || !expectedVersion || !forkCommit || !releaseRepo) {
 }
 if (!/^[0-9a-f]{40}$/.test(forkCommit)) fail(`fork commit ${forkCommit} is not a full 40-character SHA`)
 if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(releaseRepo)) fail(`release repository ${releaseRepo} is not owner/name`)
+if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(FORK)) fail(`fork ${FORK} is not owner/name`)
+if (!/^@[a-z0-9][a-z0-9-]*$/.test(SCOPE)) fail(`scope ${SCOPE} is not an npm scope`)
+if (!['https://github.com', 'https://forgejo.philflow.me'].includes(GIT_HOST)) fail(`git host ${GIT_HOST} is not one Raven's piece vetting admits`)
 
 const pieceDir = resolve(pieceDirArg)
 const slug = basename(pieceDir)
@@ -86,11 +96,13 @@ copyFileSync(licenseSource, join(distDir, 'LICENSE'))
 const name = `${SCOPE}/piece-${slug}`
 manifest.name = name
 manifest.license = 'MIT'
-manifest.repository = { type: 'git', url: `git+https://github.com/${releaseRepo}.git` }
-manifest.homepage = `https://github.com/${FORK}/tree/${forkCommit}/${pieceDirInRepo}`
+manifest.repository = { type: 'git', url: `git+${GIT_HOST}/${releaseRepo}.git` }
+manifest.homepage = GIT_HOST === 'https://github.com'
+  ? `${GIT_HOST}/${FORK}/tree/${forkCommit}/${pieceDirInRepo}`
+  : `${GIT_HOST}/${FORK}/src/commit/${forkCommit}/${pieceDirInRepo}`
 manifest.raven = {
   source: {
-    repository: `https://github.com/${FORK}`,
+    repository: `${GIT_HOST}/${FORK}`,
     commit: forkCommit,
     directory: pieceDirInRepo,
     upstreamName,
